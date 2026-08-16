@@ -183,21 +183,48 @@ jobs:
                   print(f"Unredacted credential pattern remains: {relative_path} ({label})")
               raise SystemExit("Credential sanitation failed")
 
-          invalid_json: list[str] = []
           json_files = sorted(destination.rglob("*.json"))
-          for path in json_files:
-              try:
-                  json.loads(path.read_text(encoding="utf-8"))
-              except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-                  invalid_json.append(path.relative_to(destination).as_posix())
-
-          if invalid_json:
-              for relative_path in invalid_json:
-                  print(f"Invalid JSON template: {relative_path}")
-              raise SystemExit("JSON validation failed")
-
           if len(json_files) < 280:
               raise SystemExit(f"Unexpectedly small template set: {len(json_files)} JSON files")
+
+          invalid_json: list[tuple[str, str]] = []
+          for path in json_files:
+              relative_path = path.relative_to(destination).as_posix()
+              try:
+                  json.loads(path.read_text(encoding="utf-8"))
+              except json.JSONDecodeError as exc:
+                  invalid_json.append(
+                      (relative_path, f"{exc.msg} at line {exc.lineno}, column {exc.colno}")
+                  )
+              except (OSError, UnicodeDecodeError) as exc:
+                  invalid_json.append((relative_path, type(exc).__name__))
+
+          valid_json_count = len(json_files) - len(invalid_json)
+
+          validation_lines = [
+              "# Template Validation Report",
+              "",
+              "Every `.json` file in the pinned upstream snapshot was parsed without executing it.",
+              "Malformed upstream files are preserved unchanged except for any documented credential redaction.",
+              "",
+              f"- JSON files inspected: {len(json_files)}",
+              f"- Valid JSON files: {valid_json_count}",
+              f"- Invalid JSON files: {len(invalid_json)}",
+              "",
+              "## Invalid upstream JSON",
+              "",
+          ]
+
+          if invalid_json:
+              for relative_path, reason in invalid_json:
+                  validation_lines.append(f"- `{relative_path}` — {reason}")
+          else:
+              validation_lines.append("- None.")
+
+          (destination / "GALOR-VALIDATION.md").write_text(
+              "\n".join(validation_lines) + "\n",
+              encoding="utf-8",
+          )
 
           manifest_lines = [
               "# Credential Redaction Record",
@@ -206,7 +233,7 @@ jobs:
               "Detected values were replaced with explicit `REDACTED_*` placeholders. No detected value is recorded here.",
               "",
               f"- Text files scanned: {scanned_text_files}",
-              f"- JSON files validated: {len(json_files)}",
+              f"- JSON files inspected: {len(json_files)}",
               f"- Files changed by credential sanitation: {len(redactions)}",
               "",
               "## Redactions",
@@ -226,7 +253,7 @@ jobs:
               encoding="utf-8",
           )
 
-          print(f"Validated {len(json_files)} JSON templates.")
+          print(f"Inspected {len(json_files)} JSON files: {valid_json_count} valid, {len(invalid_json)} invalid.")
           print(f"Sanitized {len(redactions)} file(s) without printing credential values.")
           PY
 
@@ -241,20 +268,21 @@ jobs:
           - Upstream URL: https://github.com/enescingoz/awesome-n8n-templates
           - Pinned upstream commit: ${UPSTREAM_COMMIT}
           - Imported on: 2026-08-16
-          - JSON files copied and validated: ${template_count}
+          - JSON files copied and inspected: ${template_count}
 
           The upstream LICENSE and CITATION.cff are preserved. The collection is
           distributed under the Creative Commons Attribution 4.0 International
           license as stated by the upstream repository.
 
           Local changes are limited to adding this notice, adding
-          GALOR-REDACTIONS.md, and replacing detected credential-shaped values
-          with explicit REDACTED placeholders. No endorsement by the upstream
-          author is implied.
+          GALOR-REDACTIONS.md and GALOR-VALIDATION.md, and replacing detected
+          credential-shaped values with explicit REDACTED placeholders. No
+          endorsement by the upstream author is implied.
 
           These workflows were copied for review and adaptation. They were not
           activated, executed, or connected to credentials during this import.
-          Review every workflow before use.
+          Review every workflow before use, especially files listed in
+          GALOR-VALIDATION.md.
           NOTICE
 
           git config user.name "github-actions[bot]"
