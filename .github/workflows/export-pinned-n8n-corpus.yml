@@ -1,0 +1,81 @@
+name: Export pinned n8n corpus
+
+on:
+  push:
+    branches:
+      - ci/export-pinned-n8n-corpus-d02ae5
+    paths:
+      - .github/workflows/export-pinned-n8n-corpus.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  qualify-and-export:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out exact pinned upstream corpus
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: enescingoz/awesome-n8n-templates
+          ref: d02ae5bbe0cf4a2f55fd2370dab87f673b6e2f95
+          path: corpus
+          persist-credentials: false
+
+      - name: Verify and package exact corpus
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test "$(git -C corpus rev-parse HEAD)" = "d02ae5bbe0cf4a2f55fd2370dab87f673b6e2f95"
+          mkdir -p artifact
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          root = Path('corpus')
+          files = sorted(root.rglob('*.json'), key=lambda p: p.relative_to(root).as_posix().casefold())
+          valid = []
+          invalid = []
+          manifest = hashlib.sha256()
+          for path in files:
+              relative = path.relative_to(root).as_posix()
+              raw = path.read_bytes()
+              digest = hashlib.sha256(raw).hexdigest()
+              manifest.update(f'{relative}\0{digest}\n'.encode())
+              try:
+                  value = json.loads(raw.decode('utf-8-sig'))
+                  if not isinstance(value, dict):
+                      raise ValueError('root JSON value is not an object')
+              except Exception as error:
+                  invalid.append({'path': relative, 'sha256': digest, 'error_type': type(error).__name__, 'error': str(error)})
+              else:
+                  valid.append({'path': relative, 'sha256': digest})
+          report = {
+              'source_repository': 'enescingoz/awesome-n8n-templates',
+              'source_commit': 'd02ae5bbe0cf4a2f55fd2370dab87f673b6e2f95',
+              'json_files': len(files),
+              'strict_valid': len(valid),
+              'malformed_or_unreadable': len(invalid),
+              'corpus_manifest_sha256': manifest.hexdigest(),
+              'invalid_files': invalid,
+              'workflow_execution_performed': False,
+          }
+          Path('artifact/corpus-validation.json').write_text(json.dumps(report, indent=2, sort_keys=True) + '\n')
+          print(json.dumps(report, indent=2, sort_keys=True))
+          assert len(files) == 344
+          assert len(valid) == 336
+          assert len(invalid) == 8
+          PY
+          git -C corpus archive --format=tar.gz --output="${GITHUB_WORKSPACE}/artifact/pinned-n8n-corpus-d02ae5.tar.gz" HEAD
+          sha256sum artifact/* | sort > artifact/SHA256SUMS
+
+      - name: Upload qualified corpus artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pinned-n8n-corpus-d02ae5
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 7
