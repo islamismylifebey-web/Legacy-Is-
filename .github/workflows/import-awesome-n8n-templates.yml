@@ -1,0 +1,90 @@
+name: Import awesome n8n template library
+
+on:
+  push:
+    branches:
+      - library/awesome-n8n-templates
+    paths:
+      - .github/workflows/import-awesome-n8n-templates.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: import-awesome-n8n-templates
+  cancel-in-progress: false
+
+jobs:
+  import-library:
+    name: Copy exact upstream files into isolated library branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out the isolated library branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: library/awesome-n8n-templates
+          fetch-depth: 0
+
+      - name: Mirror the pinned upstream commit without executing it
+        shell: bash
+        env:
+          UPSTREAM_REPO: https://github.com/enescingoz/awesome-n8n-templates.git
+          UPSTREAM_COMMIT: d02ae5bbe0cf4a2f55fd2370dab87f673b6e2f95
+          DESTINATION: libraries/awesome-n8n-templates
+        run: |
+          set -Eeuo pipefail
+
+          temporary_directory="$(mktemp -d)"
+          trap 'rm -rf "${temporary_directory}"' EXIT
+
+          git init "${temporary_directory}/upstream"
+          git -C "${temporary_directory}/upstream" remote add origin "${UPSTREAM_REPO}"
+          git -C "${temporary_directory}/upstream" fetch --depth=1 origin "${UPSTREAM_COMMIT}"
+
+          fetched_commit="$(git -C "${temporary_directory}/upstream" rev-parse FETCH_HEAD)"
+          test "${fetched_commit}" = "${UPSTREAM_COMMIT}"
+
+          git -C "${temporary_directory}/upstream" checkout --detach FETCH_HEAD
+
+          rm -rf "${DESTINATION}"
+          mkdir -p "${DESTINATION}"
+          cp -a "${temporary_directory}/upstream/." "${DESTINATION}/"
+          rm -rf "${DESTINATION}/.git"
+
+          template_count="$(find "${DESTINATION}" -type f -name '*.json' | wc -l | tr -d ' ')"
+
+          cat > "${DESTINATION}/GALOR-UPSTREAM-NOTICE.md" <<NOTICE
+          # Upstream and License Notice
+
+          This directory is an unexecuted content mirror of:
+
+          - Upstream project: enescingoz/awesome-n8n-templates
+          - Upstream URL: https://github.com/enescingoz/awesome-n8n-templates
+          - Pinned upstream commit: ${UPSTREAM_COMMIT}
+          - Imported on: 2026-08-16
+          - JSON workflow files copied: ${template_count}
+
+          The upstream LICENSE and CITATION.cff are preserved. The collection is
+          distributed under the Creative Commons Attribution 4.0 International
+          license as stated by the upstream repository. This added notice is the
+          only intentional local change. No endorsement by the upstream author is
+          implied.
+
+          These workflows were copied for review and adaptation. They were not
+          activated, executed, or connected to credentials during this import.
+          Review every workflow before use.
+          NOTICE
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "${DESTINATION}"
+
+          if git diff --cached --quiet; then
+            echo "The pinned library is already present."
+            exit 0
+          fi
+
+          git commit -m "chore: mirror awesome n8n template library"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
