@@ -1,0 +1,1129 @@
+# ============================================================
+# AI PR Review Workflow
+# ============================================================
+# Provider: any OpenAI-compatible /chat/completions endpoint.
+#
+# GitHub Models was fully retired on 2026-07-30 (the old endpoint
+# https://models.github.ai/inference/chat/completions now returns HTTP 410),
+# so inference is configured via the job-level env block below and
+# authenticated with a repo secret instead of GITHUB_TOKEN.
+#
+# Required repo secret:
+#   MODEL_API_KEY — API key for the provider configured in MODEL_ENDPOINT
+#
+# Defaults below use the Google Gemini OpenAI-compatible endpoint (free tier).
+# To switch providers, change MODEL_ENDPOINT + the two model IDs only:
+#   Gemini     : https://generativelanguage.googleapis.com/v1beta/openai/chat/completions
+#   OpenRouter : https://openrouter.ai/api/v1/chat/completions
+#   Groq       : https://api.groq.com/openai/v1/chat/completions
+#   OpenAI     : https://api.openai.com/v1/chat/completions
+#
+# Auto-provided by GitHub (no setup needed):
+#   GITHUB_TOKEN — used for gh cli calls, posting comments, and labels
+# ============================================================
+
+name: AI PR Review
+
+on:
+  # Manual trigger: backlog sweep, single PR, or retry of failed reviews
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Review mode"
+        required: true
+        type: choice
+        options:
+          - latest
+          - single
+          - backlog
+          - retry-failed
+        default: latest
+      pr_number:
+        description: "PR number (required when mode=single)"
+        required: false
+        type: string
+      force:
+        description: "Force re-review even if up to date (latest/backlog modes)"
+        required: false
+        type: boolean
+        default: false
+
+  # Auto-trigger on new/updated PRs
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+
+  # Hourly safety net: retry deferred/failed PRs & catch any missed changes
+  schedule:
+    - cron: '17 * * * *'
+
+permissions:
+  pull-requests: write
+  contents: read
+  issues: write
+
+jobs:
+  # ──────────────────────────────────────────────────────────
+  # AUTO: review a single PR when it is opened/updated
+  # ──────────────────────────────────────────────────────────
+  review-pr-auto:
+    name: Review PR (auto)
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: pr-review-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    steps:
+      - name: Review PR ${{ github.event.pull_request.number }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          SERVER_URL: ${{ github.server_url }}
+          RUN_ID: ${{ github.run_id }}
+          # ── inference provider config (repo secret + repo variables) ──
+          # Change models/endpoint in Settings → Secrets and variables → Actions
+          # → Variables. The values after || are fallbacks if a variable is unset.
+          MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
+          MODEL_ENDPOINT: ${{ vars.MODEL_ENDPOINT || 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions' }}
+          PRIMARY_MODEL: ${{ vars.PRIMARY_MODEL || 'gemini-3.6-flash' }}
+          FALLBACK_MODEL: ${{ vars.FALLBACK_MODEL || 'gemini-3.5-flash-lite' }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${MODEL_API_KEY:-}" ]; then
+            echo "::error::MODEL_API_KEY secret is not set. Add it under Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+
+          # ── helpers ──────────────────────────────────────
+          MARKER="<!-- pr-review -->"
+          RETRY_STAMP="retry-pending"   # non-SHA stamp → PR is re-reviewed next sweep
+
+          # needs_review <pr> <head_sha> — echoes "yes" or "no"
+          # "no" only when a MARKER comment exists whose reviewed-sha == head_sha.
+          # Any other stamp (including RETRY_STAMP) or a parse failure → "yes".
+          needs_review() {
+            local pr="$1"
+            local head_sha="$2"
+            local comments reviewed_sha
+            if ! comments=$(gh api "repos/${REPO}/issues/${pr}/comments" --jq '.[].body' 2>/dev/null); then
+              echo "yes"
+              return
+            fi
+            if ! printf '%s' "${comments}" | grep -qF "${MARKER}"; then
+              echo "yes"
+              return
+            fi
+            reviewed_sha=$(printf '%s' "${comments}" \
+              | grep -oE '<!-- reviewed-sha: [^ ]+ -->' \
+              | head -n1 \
+              | sed -E 's/<!-- reviewed-sha: (.*) -->/\1/')
+            if [ "${reviewed_sha}" = "${head_sha}" ]; then
+              echo "no"
+            else
+              echo "yes"
+            fi
+          }
+
+          # post_review <pr> <body> <stamp> — UPSERT one review comment.
+          post_review() {
+            local pr="$1"
+            local body="$2"
+            local stamp="$3"
+            local full_body existing_id
+            full_body="${MARKER}"$'\n'"<!-- reviewed-sha: ${stamp} -->"$'\n'"${body}"
+            existing_id=$(gh api "repos/${REPO}/issues/${pr}/comments" \
+              --jq ".[] | select(.body | contains(\"${MARKER}\")) | .id" 2>/dev/null | head -n1)
+            if [ -n "${existing_id}" ]; then
+              echo "Updating existing review comment ${existing_id} on PR #${pr}."
+              gh api "repos/${REPO}/issues/comments/${existing_id}" \
+                -X PATCH \
+                -f body="${full_body}"
+            else
+              echo "Posting new review comment on PR #${pr}."
+              gh api "repos/${REPO}/issues/${pr}/comments" \
+                -X POST \
+                -f body="${full_body}"
+            fi
+          }
+
+          # apply_verdict_label <pr> <body> — apply exactly one verdict label.
+          apply_verdict_label() {
+            local pr="$1"
+            local body="$2"
+            local verdict
+            if printf '%s' "${body}" | grep -qiE "review deferred|rate limit reached"; then
+              verdict="auto-review: deferred"
+            elif printf '%s' "${body}" | grep -qF "NEEDS CHANGES"; then
+              verdict="auto-review: needs-changes"
+            elif printf '%s' "${body}" | grep -qF "NOT A TEMPLATE"; then
+              verdict="auto-review: not-a-template"
+            elif printf '%s' "${body}" | grep -qF "SAFE TO MERGE"; then
+              verdict="auto-review: safe"
+            else
+              verdict="auto-review: error"
+            fi
+
+            # Ensure all labels exist (idempotent via --force).
+            gh label create "auto-review: safe"           --color 0e8a16 --force --repo "${REPO}" >/dev/null 2>&1 || true
+            gh label create "auto-review: needs-changes"  --color d93f0b --force --repo "${REPO}" >/dev/null 2>&1 || true
+            gh label create "auto-review: not-a-template" --color ededed --force --repo "${REPO}" >/dev/null 2>&1 || true
+            gh label create "auto-review: error"          --color b60205 --force --repo "${REPO}" >/dev/null 2>&1 || true
+            gh label create "auto-review: deferred"       --color fbca04 --force --repo "${REPO}" >/dev/null 2>&1 || true
+
+            echo "Applying verdict label '${verdict}' to PR #${pr}."
+            local current edit_args=()
+            current=$(gh pr view "${pr}" --repo "${REPO}" --json labels --jq '.labels[].name' 2>/dev/null || true)
+            local L
+            for L in "auto-review: safe" "auto-review: needs-changes" "auto-review: not-a-template" "auto-review: error" "auto-review: deferred"; do
+              if [ "${L}" = "${verdict}" ]; then
+                if ! printf '%s\n' "${current}" | grep -qxF "${L}"; then
+                  edit_args+=(--add-label "${L}")
+                fi
+              elif printf '%s\n' "${current}" | grep -qxF "${L}"; then
+                edit_args+=(--remove-label "${L}")
+              fi
+            done
+            if [ "${#edit_args[@]}" -gt 0 ]; then
+              gh pr edit "${pr}" --repo "${REPO}" "${edit_args[@]}" || true
+            else
+              echo "Label '${verdict}' already correct on PR #${pr}; no change."
+            fi
+          }
+
+          # call_model <model> <prompt>
+          #   0 = success (sets REVIEW_BODY, USED_MODEL)
+          #   1 = retries exhausted / non-retryable error (sets LAST_ERROR)
+          #   2 = payload too large (413) — caller must skip fallback
+          #   3 = rate limited beyond wait budget — defer
+          #   4 = configuration error (401/403/404/410) — caller must skip fallback
+          call_model() {
+            local model="$1"
+            local prompt="$2"
+            local attempt http_code response body
+            local RL_MAX_WAIT=300        # cap for a SINGLE 429 wait (per-minute window)
+            local RL_TOTAL_BUDGET=600    # cumulative 429 wait budget for this invocation
+            local rl_waited=0
+
+            for attempt in $(seq 1 12); do
+
+              local hdr_file retry_after_hdr err_msg
+              hdr_file="$(mktemp)"
+              # Capture body + HTTP status; dump response headers for Retry-After.
+              response=$(curl -sS -D "${hdr_file}" -w "\n%{http_code}" \
+                -X POST "${MODEL_ENDPOINT}" \
+                -H "Authorization: Bearer ${MODEL_API_KEY}" \
+                -H "Content-Type: application/json" \
+                -d "$(jq -n \
+                  --arg model "${model}" \
+                  --arg content "${prompt}" \
+                  '{
+                    model: $model,
+                    max_tokens: 1024,
+                    temperature: 0.3,
+                    messages: [{ role: "user", content: $content }]
+                  }')" 2>/dev/null) || true
+
+              http_code=$(printf '%s' "${response}" | tail -n1)
+              body=$(printf '%s' "${response}" | head -n -1)
+              retry_after_hdr=$(grep -i '^retry-after:' "${hdr_file}" | head -n1 | awk '{print $2}' | tr -d '\r\n' || true)
+              rm -f "${hdr_file}"
+
+              err_msg=$(printf '%s' "${body}" | jq -r '.error.message // .error // empty' 2>/dev/null | head -c 300 || true)
+              echo "  [attempt ${attempt}] model=${model} http=${http_code}"
+
+              if [ "${http_code}" = "200" ]; then
+                local text
+                text=$(printf '%s' "${body}" | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
+                if [ -n "${text}" ]; then
+                  REVIEW_BODY="${text}"
+                  USED_MODEL="${model}"
+                  return 0
+                fi
+                LAST_ERROR="HTTP 200 but empty content from ${model}"
+                echo "  Empty content in response; retrying..."
+              elif [ "${http_code}" = "413" ]; then
+                LAST_ERROR="HTTP 413 (payload too large) from ${model}"
+                echo "  Payload too large (413) — diff exceeds model context. Skipping retries and fallback."
+                return 2
+              elif [ "${http_code}" = "401" ] || [ "${http_code}" = "403" ] || [ "${http_code}" = "404" ] || [ "${http_code}" = "410" ]; then
+                # Bad key, revoked key, unknown model ID, or a retired endpoint.
+                # Retrying and falling back cannot help — surface it loudly.
+                LAST_ERROR="HTTP ${http_code} from ${model}: ${err_msg:-no detail}"
+                echo "::error::Inference endpoint returned ${http_code} — check MODEL_ENDPOINT, MODEL_API_KEY and model IDs. ${err_msg:-}"
+                return 4
+              elif [ "${http_code}" = "429" ]; then
+                if [ -n "${err_msg}" ]; then echo "  API error detail: ${err_msg}"; fi
+                # Wait time by priority: Retry-After header > body.retry_after >
+                # "wait N seconds" in the message > exponential backoff.
+                local wait_secs="" wait_src="" body_retry msg_retry
+                if printf '%s' "${retry_after_hdr}" | grep -qE '^[0-9]+$'; then
+                  wait_secs=$(( retry_after_hdr + 3 )); wait_src="header"
+                else
+                  body_retry=$(printf '%s' "${body}" | jq -r '.error.retry_after // empty' 2>/dev/null || true)
+                  if printf '%s' "${body_retry}" | grep -qE '^[0-9]+$'; then
+                    wait_secs=$(( body_retry + 3 )); wait_src="body"
+                  else
+                    msg_retry=$(printf '%s' "${body}" | grep -oiE 'wait[^0-9]*[0-9]+[[:space:]]*second' | grep -oE '[0-9]+' | head -n1 || true)
+                    if printf '%s' "${msg_retry}" | grep -qE '^[0-9]+$'; then
+                      wait_secs=$(( msg_retry + 3 )); wait_src="message"
+                    elif [ $(( 10 * attempt )) -lt 60 ]; then
+                      wait_secs=$(( 10 * attempt )); wait_src="backoff"
+                    else
+                      wait_secs=60; wait_src="backoff"
+                    fi
+                  fi
+                fi
+                LAST_ERROR="HTTP 429 (rate limited) from ${model}: ${err_msg:-no detail}"
+                # A long wait means a daily/long quota — don't hang the job; defer.
+                if [ "${wait_secs}" -gt "${RL_MAX_WAIT}" ]; then
+                  echo "  Rate limit needs ${wait_secs}s (> ${RL_MAX_WAIT}s cap) — likely a daily/long quota. Deferring."
+                  return 3
+                fi
+                if [ $(( rl_waited + wait_secs )) -gt "${RL_TOTAL_BUDGET}" ]; then
+                  echo "  Cumulative 429 wait budget (${RL_TOTAL_BUDGET}s) would be exceeded — deferring."
+                  return 3
+                fi
+                echo "  Rate limited (429); waiting ${wait_secs}s (source: ${wait_src}, attempt ${attempt})..."
+                sleep "${wait_secs}"
+                rl_waited=$(( rl_waited + wait_secs ))
+                continue
+              elif [ "${http_code}" -ge 500 ] 2>/dev/null; then
+                local delay
+                delay=$(( 2 ** attempt ))   # 2s, 4s, 8s
+                LAST_ERROR="HTTP ${http_code} from ${model}: ${err_msg:-no detail}"
+                echo "  Server error ${http_code}; waiting ${delay}s..."
+                if [ -n "${err_msg}" ]; then echo "  API error detail: ${err_msg}"; fi
+                sleep "${delay}"
+                if [ "${attempt}" -ge 3 ]; then
+                  echo "  Capping 5xx retries at 3 attempts."
+                  break
+                fi
+              else
+                LAST_ERROR="HTTP ${http_code} from ${model}: ${err_msg:-no detail}"
+                if [ -n "${err_msg}" ]; then echo "  API error detail: ${err_msg}"; fi
+                echo "  Non-retryable error ${http_code} from ${model}"
+                break
+              fi
+            done
+
+            return 1
+          }
+
+          # ── always re-review on every PR event (opened/reopened/synchronize) ──
+          # post_review() upserts the existing comment, so re-checking a new commit
+          # does not spam the PR with extra comments.
+
+          # Resolve the head SHA to stamp: prefer the event payload, fall back to API.
+          if [ -z "${HEAD_SHA:-}" ]; then
+            HEAD_SHA=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.head.sha')
+          fi
+          echo "Reviewing PR #${PR_NUMBER} at head ${HEAD_SHA}."
+
+          # ── fetch PR metadata (no checkout of PR code) ───
+          PR_JSON=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")
+          PR_TITLE=$(echo "${PR_JSON}" | jq -r '.title' | head -c 300)
+          PR_BODY=$(echo "${PR_JSON}"  | jq -r '.body // "(no description)"' | head -c 2000)
+          PR_AUTHOR=$(echo "${PR_JSON}" | jq -r '.user.login')
+
+          # changed files — compute pre-signals before building the prompt
+          FILES_JSON=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/files" 2>/dev/null || echo '[]')
+
+          ADDED_WORKFLOWS=$(printf '%s' "${FILES_JSON}" | jq -r '
+            [.[] | select(.status=="added") | select(.filename | endswith(".json")) | select(.filename | startswith(".github/") | not) | .filename] | join("\n")')
+
+          MODIFIED_WORKFLOWS=$(printf '%s' "${FILES_JSON}" | jq -r '
+            [.[] | select(.status=="modified") | select(.filename | endswith(".json")) | select(.filename | startswith(".github/") | not) | .filename] | join("\n")')
+
+          README_TOUCHED=$(printf '%s' "${FILES_JSON}" | jq -r '
+            if any(.[]; .filename | test("(?i)readme.*\\.md$")) then "yes" else "no" end')
+
+          # All changed filenames with status for context (capped at 50 lines)
+          FILES=$(printf '%s' "${FILES_JSON}" | jq -r '[.[] | "\(.status): \(.filename)"] | join("\n")' | head -n 50)
+
+          ADDED_WORKFLOWS_DISPLAY="${ADDED_WORKFLOWS:-none}"
+          MODIFIED_WORKFLOWS_DISPLAY="${MODIFIED_WORKFLOWS:-none}"
+
+          # diff cap — raise/lower to match the context window of your chosen model
+          DIFF=$(gh pr diff "${PR_NUMBER}" --repo "${REPO}" 2>/dev/null | head -c 40000 | iconv -c -f UTF-8 -t UTF-8 || echo "(diff unavailable)")
+
+          # ── build prompt ──────────────────────────────────
+          # Note: indented here to satisfy YAML block scalar; sed strips the indent.
+          PROMPT="You are a reviewer for an open-source curated list of n8n workflow JSON templates (awesome-n8n-templates). Your job is to check whether a PR correctly adds a new workflow template and flag real problems. Be conservative — only flag things you can clearly see in the diff.
+
+          ## PR Details
+          - **PR number**: #${PR_NUMBER}
+          - **Author**: @${PR_AUTHOR}
+          - **Title**: ${PR_TITLE}
+          - **Description**: ${PR_BODY}
+
+          ## Pre-computed PR signals
+          - New workflow JSON files added: ${ADDED_WORKFLOWS_DISPLAY}
+          - Existing workflow JSON files modified: ${MODIFIED_WORKFLOWS_DISPLAY}
+          - README touched in this PR: ${README_TOUCHED}
+
+          ## Changed Files
+          \`\`\`
+          ${FILES}
+          \`\`\`
+
+          ## Diff (may be truncated; review based on visible portion)
+          \`\`\`diff
+          ${DIFF}
+          \`\`\`
+
+          ## Rules for the verdict
+
+          Use the Pre-computed PR signals above — do NOT re-derive them from the diff.
+
+          - If \`New workflow JSON files added\` is non-empty (not \"none\"):
+              - The PR MUST also touch at least one README file. If \`README touched in this PR\` is \"no\", this is a NEEDS CHANGES issue (\"missing README entry for new template\").
+              - If README IS touched, check the README diff for self-promotion (personal sites, blogs, social handles, donations, \"follow me\" sections unrelated to listing the template). Flag any such content as NEEDS CHANGES.
+              - Additionally, scan EVERY new link (any URL or path added with a \`+\` line in the README diff) and apply the external-link rule below.
+
+          ### External-link rule for README changes
+          This repo is a curated list; it must only link to its own content and the official n8n site. When the README diff is available, inspect every line starting with \`+\` for new links (Markdown syntax \`[text](url)\`, bare URLs, or HTML href/src).
+
+          A link is ALLOWED only if it matches ONE of these:
+          - A relative path with no scheme and no host — e.g. \`OpenAI_and_LLMs/Foo.json\`, \`./Slack/bar.json\`, \`#section-anchor\`
+          - The repo's own GitHub URL: host is \`github.com\` AND path starts with \`/enescingoz/awesome-n8n-templates\`
+          - The official n8n site: host is \`n8n.io\` or any subdomain of \`n8n.io\` (e.g. \`docs.n8n.io\`, \`community.n8n.io\`)
+
+          ANY other URL must be flagged as self-promotion → NEEDS CHANGES. This includes, but is not limited to:
+          - External GitHub repos or forks: \`github.com/<anyone-else>/...\` or \`github.com/enescingoz/<other-repo>\`
+          - Personal blogs, Medium, Substack, Dev.to articles
+          - Personal websites, portfolios, landing pages
+          - Affiliate / referral / monetisation links (Gumroad, Patreon, BuyMeACoffee, partnerlinks.io, etc.)
+          - Social media: Twitter/X, LinkedIn, Instagram, Facebook, TikTok
+          - YouTube or other video platforms
+          - Any \"read more here\", \"full guide here\", \"multilingual version here\" link pointing off-repo
+
+          When flagging, the action item must be: \"Remove external link(s) added to the README — this repo only links to its own templates.\" and list the specific URL(s) found.
+
+          - If \`New workflow JSON files added\` is \"none\" AND \`Existing workflow JSON files modified\` is non-empty (not \"none\"):
+              - This is an EDIT to an existing template. README update is NOT required. Focus only on: real hardcoded secrets, invalid JSON, malicious code.
+          - If both \`New workflow JSON files added\` and \`Existing workflow JSON files modified\` are \"none\":
+              - Verdict is NOT A TEMPLATE PR. Do not perform other checks.
+
+          ## SECONDARY CHECKS (flag only if clearly evident — do NOT be picky)
+
+          ### Real hardcoded secrets
+          A real hardcoded secret is a long (20+ characters) random-looking token, password, or key embedded LITERALLY in the JSON — for example:
+          - OpenAI keys starting with \"sk-\"
+          - AWS access keys starting with \"AKIA\"
+          - Long hex/base64 strings that look like real tokens
+
+          IMPORTANT — do NOT flag these patterns as secrets (they are safe n8n template syntax):
+          - {{ \$vars.ANYTHING }} — n8n variable reference
+          - {{ \$env.ANYTHING }} — n8n environment variable reference
+          - {{ \$credentials.ANYTHING }} — n8n credential reference
+          - {{ \$secrets.ANYTHING }} — n8n secrets reference
+          - {{ \$json.ANYTHING }}, {{ \$node.ANYTHING }}, {{ \$item.ANYTHING }} — n8n expression syntax
+          - Placeholder strings like YOUR_API_KEY_HERE, <YOUR_TOKEN>, REPLACE_ME, etc.
+          - Any value inside an n8n credential node (those are references, not literal secrets)
+
+          ### Broken JSON
+          If the diff contains malformed JSON (unclosed brackets, invalid syntax) that would prevent the workflow from loading in n8n, flag it.
+
+          ### Obvious malicious code
+          Flag only clear malicious intent inside n8n Function/Code nodes: eval() on remote content, fetching and executing remote scripts, exfiltrating environment variables to attacker-controlled domains.
+          Do NOT flag: normal HTTP requests to legitimate third-party APIs. The following domains and services are always safe — do not flag them: Telegram, WhatsApp, CallMeBot, TextBelt, Gmail, Slack, Discord, Notion, Airtable, OpenAI, Anthropic, Google APIs (googleapis.com), AWS official endpoints, GitHub API, HubSpot, Salesforce, Stripe, and any other well-known SaaS/API.
+
+          ## THINGS YOU MUST NOT FLAG (these produce noise and false positives)
+          - n8n expression syntax: {{ \$vars.X }}, {{ \$env.X }}, {{ \$json.X }}, {{ \$node.X }}, {{ \$item.X }}, {{ \$workflow.X }}, {{ \$runIndex }}, etc.
+          - HTTP requests to legitimate third-party APIs or web services
+          - \"Overly broad permissions\" — you cannot judge this from a workflow JSON
+          - Duplicate templates — you cannot know what is already in the repo
+          - Code style, naming conventions, or non-security formatting issues
+
+          ## VERDICT SCALE
+
+          Use exactly one of these three verdicts:
+
+          **SAFE TO MERGE** — Workflow JSON added, README entry present (or this is a modify-only PR), no self-promotion, no external links in README, no real hardcoded secrets, JSON appears valid.
+
+          **NEEDS CHANGES** — One or more of: missing README entry for a newly added template, self-promotion/pollution in README, external link(s) added to the README that are not relative paths or approved domains (n8n.io, this repo's own GitHub URL), real hardcoded secret found, clearly broken JSON. List only the concrete issues found.
+
+          **NOT A TEMPLATE PR** — The PR does not add or modify any n8n workflow JSON file (e.g. it is a docs fix, typo correction, README-only change, or meta change). This is INFORMATIONAL — no action items needed.
+
+          ## REQUIRED OUTPUT FORMAT
+          Respond with EXACTLY these three sections and no other content:
+
+          ### Summary
+          2-4 bullet points describing what this PR does.
+
+          ### Safety Assessment
+          **SAFE TO MERGE** or **NEEDS CHANGES** or **NOT A TEMPLATE PR**
+
+          Brief rationale (1-3 sentences).
+
+          ### Action Items
+          If SAFE TO MERGE: \"None — looks good.\"
+          If NEEDS CHANGES: concrete, minimal list of what must be fixed.
+          If NOT A TEMPLATE PR: \"Not a template submission — review manually.\"
+
+          Be concise. This review will be posted as a GitHub comment."
+          PROMPT=$(printf '%s' "${PROMPT}" | sed 's/^          //')
+
+          # ── call the model, with fallback ─────────────────
+          REVIEW_BODY=""
+          USED_MODEL=""
+          LAST_ERROR=""
+          STAMP="${HEAD_SHA}"
+
+          echo "Trying primary model: ${PRIMARY_MODEL}"
+          set +e
+          call_model "${PRIMARY_MODEL}" "${PROMPT}"
+          rc=$?
+          set -e
+
+          case "${rc}" in
+            0)
+              ;;
+            2)
+              echo "Payload too large for primary — skipping fallback (same cap applies)."
+              REVIEW_BODY="Automated review skipped — this PR's diff exceeds the model's context window. Please review manually."
+              USED_MODEL="(skipped: payload too large)"
+              ;;
+            4)
+              echo "Configuration error — skipping fallback."
+              REVIEW_BODY="⚠️ Automated review unavailable — inference endpoint misconfigured or unreachable (${LAST_ERROR}). This PR will be retried automatically once the workflow config is fixed."
+              USED_MODEL="(configuration error)"
+              STAMP="${RETRY_STAMP}"
+              ;;
+            *)
+              echo "Primary model failed. Trying fallback: ${FALLBACK_MODEL}"
+              set +e
+              call_model "${FALLBACK_MODEL}" "${PROMPT}"
+              rc2=$?
+              set -e
+
+              case "${rc2}" in
+                0)
+                  ;;
+                2)
+                  echo "Payload too large for fallback as well."
+                  REVIEW_BODY="Automated review skipped — this PR's diff exceeds the model's context window. Please review manually."
+                  USED_MODEL="(skipped: payload too large)"
+                  ;;
+                3)
+                  echo "Fallback also rate-limited — deferring review."
+                  REVIEW_BODY="⏳ Automated review deferred — model provider rate limit reached. This PR will be re-reviewed automatically on the next push or the next scheduled sweep."
+                  USED_MODEL="(rate-limited — deferred)"
+                  STAMP="${RETRY_STAMP}"
+                  ;;
+                4)
+                  echo "Configuration error on fallback."
+                  REVIEW_BODY="⚠️ Automated review unavailable — inference endpoint misconfigured or unreachable (${LAST_ERROR}). This PR will be retried automatically once the workflow config is fixed."
+                  USED_MODEL="(configuration error)"
+                  STAMP="${RETRY_STAMP}"
+                  ;;
+                *)
+                  echo "Both models failed. Posting fallback comment."
+                  REVIEW_BODY="⚠️ Automated review unavailable — ${LAST_ERROR:-unknown error}. This PR will be retried automatically on the next scheduled sweep."
+                  USED_MODEL="(unavailable)"
+                  STAMP="${RETRY_STAMP}"
+                  ;;
+              esac
+              ;;
+          esac
+
+          # ── compose and post comment ──────────────────────
+          COMMENT="## 🤖 Automated PR Review
+
+          ${REVIEW_BODY}
+
+          ---
+          <sub>Reviewed by \`${USED_MODEL}\` · [Workflow run](${SERVER_URL}/${REPO}/actions/runs/${RUN_ID})</sub>"
+          COMMENT=$(printf '%s' "${COMMENT}" | sed 's/^          //')
+
+          post_review "${PR_NUMBER}" "${COMMENT}" "${STAMP}"
+          apply_verdict_label "${PR_NUMBER}" "${REVIEW_BODY}"
+          echo "Review posted on PR #${PR_NUMBER} (model: ${USED_MODEL}, stamp: ${STAMP})."
+
+  # ──────────────────────────────────────────────────────────
+  # MANUAL / SCHEDULED: backlog sweep, single PR, retry failed
+  # ──────────────────────────────────────────────────────────
+  review-pr-manual:
+    name: Review PR (manual/scheduled)
+    if: (github.event_name == 'workflow_dispatch' && github.actor == github.repository_owner) || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Run review
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SERVER_URL: ${{ github.server_url }}
+          RUN_ID: ${{ github.run_id }}
+          # On schedule, inputs.* are empty → default to a backlog sweep.
+          MODE: ${{ inputs.mode || (github.event_name == 'schedule' && 'backlog' || 'latest') }}
+          INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+          FORCE: ${{ inputs.force || false }}
+          # ── inference provider config (same secret + variables as the auto job) ──
+          MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
+          MODEL_ENDPOINT: ${{ vars.MODEL_ENDPOINT || 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions' }}
+          PRIMARY_MODEL: ${{ vars.PRIMARY_MODEL || 'gemini-3.6-flash' }}
+          FALLBACK_MODEL: ${{ vars.FALLBACK_MODEL || 'gemini-3.5-flash-lite' }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${MODEL_API_KEY:-}" ]; then
+            echo "::error::MODEL_API_KEY secret is not set. Add it under Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+
+          # ── helpers ──────────────────────────────────────
+          MARKER="<!-- pr-review -->"
+          RETRY_STAMP="retry-pending"
+          MAX_PER_SWEEP=15          # PRs reviewed per scheduled/backlog run
+          PACE_SECONDS=15           # gap between PRs, to stay under the provider RPM cap
+
+          needs_review() {
+            local pr="$1"
+            local head_sha="$2"
+            local comments reviewed_sha
+            if ! comments=$(gh api "repos/${REPO}/issues/${pr}/comments" --jq '.[].body' 2>/dev/null); then
+              echo "yes"
+              return
+            fi
+            if ! printf '%s' "${comments}" | grep -qF "${MARKER}"; then
+              echo "yes"
+              return
+            fi
+            reviewed_sha=$(printf '%s' "${comments}" \
+              | grep -oE '<!-- reviewed-sha: [^ ]+ -->' \
+              | head -n1 \
+              | sed -E 's/<!-- reviewed-sha: (.*) -->/\1/')
+            if [ "${reviewed_sha}" = "${head_sha}" ]; then
+              echo "no"
+            else
+              echo "yes"
+            fi
+          }
+
+          # is_failed_pr <pr> — "yes" when the PR carries an error/deferred label,
+          # i.e. its last review attempt did not produce a real verdict. These are
+          # re-reviewed even when the stamp matches the head SHA (legacy failures
+          # were stamped with the real SHA and would otherwise be skipped forever).
+          is_failed_pr() {
+            local pr="$1"
+            local labels
+            labels=$(gh pr view "${pr}" --repo "${REPO}" --json labels --jq '.labels[].name' 2>/dev/null || true)
+            if printf '%s\n' "${labels}" | grep -qxE "auto-review: (error|deferred)"; then
+              echo "yes"
+            else
+              echo "no"
+            fi
+          }
+
+          post_review() {
+            local pr="$1"
+            local body="$2"
+            local stamp="$3"
+            local full_body existing_id
+            full_body="${MARKER}"$'\n'"<!-- reviewed-sha: ${stamp} -->"$'\n'"${body}"
+            existing_id=$(gh api "repos/${REPO}/issues/${pr}/comments" \
+              --jq ".[] | select(.body | contains(\"${MARKER}\")) | .id" 2>/dev/null | head -n1)
+            if [ -n "${existing_id}" ]; then
+              echo "Updating existing review comment ${existing_id} on PR #${pr}."
+              gh api "repos/${REPO}/issues/comments/${existing_id}" \
+                -X PATCH \
+                -f body="${full_body}"
+            else
+              echo "Posting new review comment on PR #${pr}."
+              gh api "repos/${REPO}/issues/${pr}/comments" \
+                -X POST \
+                -f body="${full_body}"
+            fi
+          }
+
+          apply_verdict_label() {
+            local pr="$1"
+            local body="$2"
+            local verdict
+            if printf '%s' "${body}" | grep -qiE "review deferred|rate limit reached"; then
+              verdict="auto-review: deferred"
+            elif printf '%s' "${body}" | grep -qF "NEEDS CHANGES"; then
+              verdict="auto-review: needs-changes"
+            elif printf '%s' "${body}" | grep -qF "NOT A TEMPLATE"; then
+              verdict="auto-review: not-a-template"
+            elif printf '%s' "${body}" | grep -qF "SAFE TO MERGE"; then
+              verdict="auto-review: safe"
+            else
+              verdict="auto-review: error"
+            fi
+
+            gh label create "auto-review: safe"           --color 0e8a16 --force --repo "${REPO}" >/dev/null 2>&1 || true
+            gh label create "auto-review: needs-changes"  --color d93f0b --force --repo "${REPO}" >/dev/null 2>&1 || true
+            gh label create "auto-review: not-a-template" --color ededed --force --repo "${REPO}" >/dev/null 2>&1 || true
+            gh label create "auto-review: error"          --color b60205 --force --repo "${REPO}" >/dev/null 2>&1 || true
+            gh label create "auto-review: deferred"       --color fbca04 --force --repo "${REPO}" >/dev/null 2>&1 || true
+
+            echo "Applying verdict label '${verdict}' to PR #${pr}."
+            local current edit_args=()
+            current=$(gh pr view "${pr}" --repo "${REPO}" --json labels --jq '.labels[].name' 2>/dev/null || true)
+            local L
+            for L in "auto-review: safe" "auto-review: needs-changes" "auto-review: not-a-template" "auto-review: error" "auto-review: deferred"; do
+              if [ "${L}" = "${verdict}" ]; then
+                if ! printf '%s\n' "${current}" | grep -qxF "${L}"; then
+                  edit_args+=(--add-label "${L}")
+                fi
+              elif printf '%s\n' "${current}" | grep -qxF "${L}"; then
+                edit_args+=(--remove-label "${L}")
+              fi
+            done
+            if [ "${#edit_args[@]}" -gt 0 ]; then
+              gh pr edit "${pr}" --repo "${REPO}" "${edit_args[@]}" || true
+            else
+              echo "Label '${verdict}' already correct on PR #${pr}; no change."
+            fi
+          }
+
+          # call_model <model> <prompt>
+          #   0 = success  1 = failed  2 = 413  3 = rate-limit defer  4 = config error
+          call_model() {
+            local model="$1"
+            local prompt="$2"
+            local attempt http_code response body
+            local RL_MAX_WAIT=300
+            local RL_TOTAL_BUDGET=600
+            local rl_waited=0
+
+            for attempt in $(seq 1 12); do
+
+              local hdr_file retry_after_hdr err_msg
+              hdr_file="$(mktemp)"
+              response=$(curl -sS -D "${hdr_file}" -w "\n%{http_code}" \
+                -X POST "${MODEL_ENDPOINT}" \
+                -H "Authorization: Bearer ${MODEL_API_KEY}" \
+                -H "Content-Type: application/json" \
+                -d "$(jq -n \
+                  --arg model "${model}" \
+                  --arg content "${prompt}" \
+                  '{
+                    model: $model,
+                    max_tokens: 1024,
+                    temperature: 0.3,
+                    messages: [{ role: "user", content: $content }]
+                  }')" 2>/dev/null) || true
+
+              http_code=$(printf '%s' "${response}" | tail -n1)
+              body=$(printf '%s' "${response}" | head -n -1)
+              retry_after_hdr=$(grep -i '^retry-after:' "${hdr_file}" | head -n1 | awk '{print $2}' | tr -d '\r\n' || true)
+              rm -f "${hdr_file}"
+
+              err_msg=$(printf '%s' "${body}" | jq -r '.error.message // .error // empty' 2>/dev/null | head -c 300 || true)
+              echo "  [attempt ${attempt}] model=${model} http=${http_code}"
+
+              if [ "${http_code}" = "200" ]; then
+                local text
+                text=$(printf '%s' "${body}" | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
+                if [ -n "${text}" ]; then
+                  REVIEW_BODY="${text}"
+                  USED_MODEL="${model}"
+                  return 0
+                fi
+                LAST_ERROR="HTTP 200 but empty content from ${model}"
+                echo "  Empty content in response; retrying..."
+              elif [ "${http_code}" = "413" ]; then
+                LAST_ERROR="HTTP 413 (payload too large) from ${model}"
+                echo "  Payload too large (413) — diff exceeds model context. Skipping retries and fallback."
+                return 2
+              elif [ "${http_code}" = "401" ] || [ "${http_code}" = "403" ] || [ "${http_code}" = "404" ] || [ "${http_code}" = "410" ]; then
+                LAST_ERROR="HTTP ${http_code} from ${model}: ${err_msg:-no detail}"
+                echo "::error::Inference endpoint returned ${http_code} — check MODEL_ENDPOINT, MODEL_API_KEY and model IDs. ${err_msg:-}"
+                return 4
+              elif [ "${http_code}" = "429" ]; then
+                if [ -n "${err_msg}" ]; then echo "  API error detail: ${err_msg}"; fi
+                local wait_secs="" wait_src="" body_retry msg_retry
+                if printf '%s' "${retry_after_hdr}" | grep -qE '^[0-9]+$'; then
+                  wait_secs=$(( retry_after_hdr + 3 )); wait_src="header"
+                else
+                  body_retry=$(printf '%s' "${body}" | jq -r '.error.retry_after // empty' 2>/dev/null || true)
+                  if printf '%s' "${body_retry}" | grep -qE '^[0-9]+$'; then
+                    wait_secs=$(( body_retry + 3 )); wait_src="body"
+                  else
+                    msg_retry=$(printf '%s' "${body}" | grep -oiE 'wait[^0-9]*[0-9]+[[:space:]]*second' | grep -oE '[0-9]+' | head -n1 || true)
+                    if printf '%s' "${msg_retry}" | grep -qE '^[0-9]+$'; then
+                      wait_secs=$(( msg_retry + 3 )); wait_src="message"
+                    elif [ $(( 10 * attempt )) -lt 60 ]; then
+                      wait_secs=$(( 10 * attempt )); wait_src="backoff"
+                    else
+                      wait_secs=60; wait_src="backoff"
+                    fi
+                  fi
+                fi
+                LAST_ERROR="HTTP 429 (rate limited) from ${model}: ${err_msg:-no detail}"
+                if [ "${wait_secs}" -gt "${RL_MAX_WAIT}" ]; then
+                  echo "  Rate limit needs ${wait_secs}s (> ${RL_MAX_WAIT}s cap) — likely a daily/long quota. Deferring."
+                  return 3
+                fi
+                if [ $(( rl_waited + wait_secs )) -gt "${RL_TOTAL_BUDGET}" ]; then
+                  echo "  Cumulative 429 wait budget (${RL_TOTAL_BUDGET}s) would be exceeded — deferring."
+                  return 3
+                fi
+                echo "  Rate limited (429); waiting ${wait_secs}s (source: ${wait_src}, attempt ${attempt})..."
+                sleep "${wait_secs}"
+                rl_waited=$(( rl_waited + wait_secs ))
+                continue
+              elif [ "${http_code}" -ge 500 ] 2>/dev/null; then
+                local delay
+                delay=$(( 2 ** attempt ))
+                LAST_ERROR="HTTP ${http_code} from ${model}: ${err_msg:-no detail}"
+                echo "  Server error ${http_code}; waiting ${delay}s..."
+                if [ -n "${err_msg}" ]; then echo "  API error detail: ${err_msg}"; fi
+                sleep "${delay}"
+                if [ "${attempt}" -ge 3 ]; then
+                  echo "  Capping 5xx retries at 3 attempts."
+                  break
+                fi
+              else
+                LAST_ERROR="HTTP ${http_code} from ${model}: ${err_msg:-no detail}"
+                if [ -n "${err_msg}" ]; then echo "  API error detail: ${err_msg}"; fi
+                echo "  Non-retryable error ${http_code} from ${model}"
+                break
+              fi
+            done
+
+            return 1
+          }
+
+          review_one_pr() {
+            local PR_NUMBER="$1"
+            local HEAD_SHA STAMP
+
+            echo "--- Reviewing PR #${PR_NUMBER} ---"
+
+            # fetch metadata (no checkout)
+            PR_JSON=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")
+            HEAD_SHA=$(echo "${PR_JSON}" | jq -r '.head.sha')
+            PR_TITLE=$(echo "${PR_JSON}" | jq -r '.title' | head -c 300)
+            PR_BODY=$(echo "${PR_JSON}"  | jq -r '.body // "(no description)"' | head -c 2000)
+            PR_AUTHOR=$(echo "${PR_JSON}" | jq -r '.user.login')
+
+            # changed files — compute pre-signals before building the prompt
+            FILES_JSON=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/files" 2>/dev/null || echo '[]')
+
+            ADDED_WORKFLOWS=$(printf '%s' "${FILES_JSON}" | jq -r '
+              [.[] | select(.status=="added") | select(.filename | endswith(".json")) | select(.filename | startswith(".github/") | not) | .filename] | join("\n")')
+
+            MODIFIED_WORKFLOWS=$(printf '%s' "${FILES_JSON}" | jq -r '
+              [.[] | select(.status=="modified") | select(.filename | endswith(".json")) | select(.filename | startswith(".github/") | not) | .filename] | join("\n")')
+
+            README_TOUCHED=$(printf '%s' "${FILES_JSON}" | jq -r '
+              if any(.[]; .filename | test("(?i)readme.*\\.md$")) then "yes" else "no" end')
+
+            FILES=$(printf '%s' "${FILES_JSON}" | jq -r '[.[] | "\(.status): \(.filename)"] | join("\n")' | head -n 50)
+
+            ADDED_WORKFLOWS_DISPLAY="${ADDED_WORKFLOWS:-none}"
+            MODIFIED_WORKFLOWS_DISPLAY="${MODIFIED_WORKFLOWS:-none}"
+
+            # diff cap — raise/lower to match the context window of your chosen model
+            DIFF=$(gh pr diff "${PR_NUMBER}" --repo "${REPO}" 2>/dev/null | head -c 40000 | iconv -c -f UTF-8 -t UTF-8 || echo "(diff unavailable)")
+
+            # Note: indented here to satisfy YAML block scalar; sed strips the indent.
+            PROMPT="You are a reviewer for an open-source curated list of n8n workflow JSON templates (awesome-n8n-templates). Your job is to check whether a PR correctly adds a new workflow template and flag real problems. Be conservative — only flag things you can clearly see in the diff.
+
+          ## PR Details
+          - **PR number**: #${PR_NUMBER}
+          - **Author**: @${PR_AUTHOR}
+          - **Title**: ${PR_TITLE}
+          - **Description**: ${PR_BODY}
+
+          ## Pre-computed PR signals
+          - New workflow JSON files added: ${ADDED_WORKFLOWS_DISPLAY}
+          - Existing workflow JSON files modified: ${MODIFIED_WORKFLOWS_DISPLAY}
+          - README touched in this PR: ${README_TOUCHED}
+
+          ## Changed Files
+          \`\`\`
+          ${FILES}
+          \`\`\`
+
+          ## Diff (may be truncated; review based on visible portion)
+          \`\`\`diff
+          ${DIFF}
+          \`\`\`
+
+          ## Rules for the verdict
+
+          Use the Pre-computed PR signals above — do NOT re-derive them from the diff.
+
+          - If \`New workflow JSON files added\` is non-empty (not \"none\"):
+              - The PR MUST also touch at least one README file. If \`README touched in this PR\` is \"no\", this is a NEEDS CHANGES issue (\"missing README entry for new template\").
+              - If README IS touched, check the README diff for self-promotion (personal sites, blogs, social handles, donations, \"follow me\" sections unrelated to listing the template). Flag any such content as NEEDS CHANGES.
+              - Additionally, scan EVERY new link (any URL or path added with a \`+\` line in the README diff) and apply the external-link rule below.
+
+          ### External-link rule for README changes
+          This repo is a curated list; it must only link to its own content and the official n8n site. When the README diff is available, inspect every line starting with \`+\` for new links (Markdown syntax \`[text](url)\`, bare URLs, or HTML href/src).
+
+          A link is ALLOWED only if it matches ONE of these:
+          - A relative path with no scheme and no host — e.g. \`OpenAI_and_LLMs/Foo.json\`, \`./Slack/bar.json\`, \`#section-anchor\`
+          - The repo's own GitHub URL: host is \`github.com\` AND path starts with \`/enescingoz/awesome-n8n-templates\`
+          - The official n8n site: host is \`n8n.io\` or any subdomain of \`n8n.io\` (e.g. \`docs.n8n.io\`, \`community.n8n.io\`)
+
+          ANY other URL must be flagged as self-promotion → NEEDS CHANGES. This includes, but is not limited to:
+          - External GitHub repos or forks: \`github.com/<anyone-else>/...\` or \`github.com/enescingoz/<other-repo>\`
+          - Personal blogs, Medium, Substack, Dev.to articles
+          - Personal websites, portfolios, landing pages
+          - Affiliate / referral / monetisation links (Gumroad, Patreon, BuyMeACoffee, partnerlinks.io, etc.)
+          - Social media: Twitter/X, LinkedIn, Instagram, Facebook, TikTok
+          - YouTube or other video platforms
+          - Any \"read more here\", \"full guide here\", \"multilingual version here\" link pointing off-repo
+
+          When flagging, the action item must be: \"Remove external link(s) added to the README — this repo only links to its own templates.\" and list the specific URL(s) found.
+
+          - If \`New workflow JSON files added\` is \"none\" AND \`Existing workflow JSON files modified\` is non-empty (not \"none\"):
+              - This is an EDIT to an existing template. README update is NOT required. Focus only on: real hardcoded secrets, invalid JSON, malicious code.
+          - If both \`New workflow JSON files added\` and \`Existing workflow JSON files modified\` are \"none\":
+              - Verdict is NOT A TEMPLATE PR. Do not perform other checks.
+
+          ## SECONDARY CHECKS (flag only if clearly evident — do NOT be picky)
+
+          ### Real hardcoded secrets
+          A real hardcoded secret is a long (20+ characters) random-looking token, password, or key embedded LITERALLY in the JSON — for example:
+          - OpenAI keys starting with \"sk-\"
+          - AWS access keys starting with \"AKIA\"
+          - Long hex/base64 strings that look like real tokens
+
+          IMPORTANT — do NOT flag these patterns as secrets (they are safe n8n template syntax):
+          - {{ \$vars.ANYTHING }} — n8n variable reference
+          - {{ \$env.ANYTHING }} — n8n environment variable reference
+          - {{ \$credentials.ANYTHING }} — n8n credential reference
+          - {{ \$secrets.ANYTHING }} — n8n secrets reference
+          - {{ \$json.ANYTHING }}, {{ \$node.ANYTHING }}, {{ \$item.ANYTHING }} — n8n expression syntax
+          - Placeholder strings like YOUR_API_KEY_HERE, <YOUR_TOKEN>, REPLACE_ME, etc.
+          - Any value inside an n8n credential node (those are references, not literal secrets)
+
+          ### Broken JSON
+          If the diff contains malformed JSON (unclosed brackets, invalid syntax) that would prevent the workflow from loading in n8n, flag it.
+
+          ### Obvious malicious code
+          Flag only clear malicious intent inside n8n Function/Code nodes: eval() on remote content, fetching and executing remote scripts, exfiltrating environment variables to attacker-controlled domains.
+          Do NOT flag: normal HTTP requests to legitimate third-party APIs. The following domains and services are always safe — do not flag them: Telegram, WhatsApp, CallMeBot, TextBelt, Gmail, Slack, Discord, Notion, Airtable, OpenAI, Anthropic, Google APIs (googleapis.com), AWS official endpoints, GitHub API, HubSpot, Salesforce, Stripe, and any other well-known SaaS/API.
+
+          ## THINGS YOU MUST NOT FLAG (these produce noise and false positives)
+          - n8n expression syntax: {{ \$vars.X }}, {{ \$env.X }}, {{ \$json.X }}, {{ \$node.X }}, {{ \$item.X }}, {{ \$workflow.X }}, {{ \$runIndex }}, etc.
+          - HTTP requests to legitimate third-party APIs or web services
+          - \"Overly broad permissions\" — you cannot judge this from a workflow JSON
+          - Duplicate templates — you cannot know what is already in the repo
+          - Code style, naming conventions, or non-security formatting issues
+
+          ## VERDICT SCALE
+
+          Use exactly one of these three verdicts:
+
+          **SAFE TO MERGE** — Workflow JSON added, README entry present (or this is a modify-only PR), no self-promotion, no external links in README, no real hardcoded secrets, JSON appears valid.
+
+          **NEEDS CHANGES** — One or more of: missing README entry for a newly added template, self-promotion/pollution in README, external link(s) added to the README that are not relative paths or approved domains (n8n.io, this repo's own GitHub URL), real hardcoded secret found, clearly broken JSON. List only the concrete issues found.
+
+          **NOT A TEMPLATE PR** — The PR does not add or modify any n8n workflow JSON file (e.g. it is a docs fix, typo correction, README-only change, or meta change). This is INFORMATIONAL — no action items needed.
+
+          ## REQUIRED OUTPUT FORMAT
+          Respond with EXACTLY these three sections and no other content:
+
+          ### Summary
+          2-4 bullet points describing what this PR does.
+
+          ### Safety Assessment
+          **SAFE TO MERGE** or **NEEDS CHANGES** or **NOT A TEMPLATE PR**
+
+          Brief rationale (1-3 sentences).
+
+          ### Action Items
+          If SAFE TO MERGE: \"None — looks good.\"
+          If NEEDS CHANGES: concrete, minimal list of what must be fixed.
+          If NOT A TEMPLATE PR: \"Not a template submission — review manually.\"
+
+          Be concise. This review will be posted as a GitHub comment."
+            PROMPT=$(printf '%s' "${PROMPT}" | sed 's/^          //')
+
+            REVIEW_BODY=""
+            USED_MODEL=""
+            LAST_ERROR=""
+            STAMP="${HEAD_SHA}"
+
+            echo "Trying primary model: ${PRIMARY_MODEL}"
+            set +e
+            call_model "${PRIMARY_MODEL}" "${PROMPT}"
+            rc=$?
+            set -e
+
+            case "${rc}" in
+              0)
+                ;;
+              2)
+                echo "Payload too large for primary — skipping fallback (same cap applies)."
+                REVIEW_BODY="Automated review skipped — this PR's diff exceeds the model's context window. Please review manually."
+                USED_MODEL="(skipped: payload too large)"
+                ;;
+              4)
+                echo "Configuration error — skipping fallback."
+                REVIEW_BODY="⚠️ Automated review unavailable — inference endpoint misconfigured or unreachable (${LAST_ERROR}). This PR will be retried automatically once the workflow config is fixed."
+                USED_MODEL="(configuration error)"
+                STAMP="${RETRY_STAMP}"
+                ;;
+              *)
+                echo "Primary model failed. Trying fallback: ${FALLBACK_MODEL}"
+                set +e
+                call_model "${FALLBACK_MODEL}" "${PROMPT}"
+                rc2=$?
+                set -e
+
+                case "${rc2}" in
+                  0)
+                    ;;
+                  2)
+                    echo "Payload too large for fallback as well."
+                    REVIEW_BODY="Automated review skipped — this PR's diff exceeds the model's context window. Please review manually."
+                    USED_MODEL="(skipped: payload too large)"
+                    ;;
+                  3)
+                    echo "Fallback also rate-limited — deferring review."
+                    REVIEW_BODY="⏳ Automated review deferred — model provider rate limit reached. This PR will be re-reviewed automatically on the next push or the next scheduled sweep."
+                    USED_MODEL="(rate-limited — deferred)"
+                    STAMP="${RETRY_STAMP}"
+                    ;;
+                  4)
+                    echo "Configuration error on fallback."
+                    REVIEW_BODY="⚠️ Automated review unavailable — inference endpoint misconfigured or unreachable (${LAST_ERROR}). This PR will be retried automatically once the workflow config is fixed."
+                    USED_MODEL="(configuration error)"
+                    STAMP="${RETRY_STAMP}"
+                    ;;
+                  *)
+                    echo "Both models failed. Posting fallback comment."
+                    REVIEW_BODY="⚠️ Automated review unavailable — ${LAST_ERROR:-unknown error}. This PR will be retried automatically on the next scheduled sweep."
+                    USED_MODEL="(unavailable)"
+                    STAMP="${RETRY_STAMP}"
+                    ;;
+                esac
+                ;;
+            esac
+
+            COMMENT="## 🤖 Automated PR Review
+
+          ${REVIEW_BODY}
+
+          ---
+          <sub>Reviewed by \`${USED_MODEL}\` · [Workflow run](${SERVER_URL}/${REPO}/actions/runs/${RUN_ID})</sub>"
+            COMMENT=$(printf '%s' "${COMMENT}" | sed 's/^          //')
+
+            post_review "${PR_NUMBER}" "${COMMENT}" "${STAMP}"
+            apply_verdict_label "${PR_NUMBER}" "${REVIEW_BODY}"
+            echo "Review posted on PR #${PR_NUMBER} (model: ${USED_MODEL}, stamp: ${STAMP})."
+          }
+
+          # ── mode dispatch ─────────────────────────────────
+          if [ "${MODE}" = "latest" ]; then
+            echo "Mode=latest: finding most recently opened open PR..."
+            LATEST_PR=$(gh pr list --repo "${REPO}" --state open --json number,createdAt \
+              --jq 'sort_by(.createdAt) | reverse | .[0].number')
+
+            if [ -z "${LATEST_PR}" ] || [ "${LATEST_PR}" = "null" ]; then
+              echo "No open PRs found."
+              exit 0
+            fi
+
+            echo "Latest open PR: #${LATEST_PR}"
+
+            HEAD_SHA=$(gh api "repos/${REPO}/pulls/${LATEST_PR}" --jq '.head.sha')
+
+            if [ "${FORCE}" != "true" ] \
+               && [ "$(needs_review "${LATEST_PR}" "${HEAD_SHA}")" = "no" ] \
+               && [ "$(is_failed_pr "${LATEST_PR}")" = "no" ]; then
+              echo "PR #${LATEST_PR} already up to date — nothing to do (use force=true to re-review)."
+              exit 0
+            fi
+
+            review_one_pr "${LATEST_PR}"
+
+          elif [ "${MODE}" = "single" ]; then
+            if [ -z "${INPUT_PR_NUMBER}" ]; then
+              echo "ERROR: pr_number input is required when mode=single"
+              exit 1
+            fi
+            # single mode ALWAYS force re-reviews — ignore needs_review.
+            review_one_pr "${INPUT_PR_NUMBER}"
+
+          elif [ "${MODE}" = "retry-failed" ]; then
+            echo "Mode=retry-failed: finding open PRs labelled error/deferred..."
+            FAILED_PRS=$( {
+              gh pr list --repo "${REPO}" --state open --label "auto-review: error"    --json number --jq '.[].number' 2>/dev/null || true
+              gh pr list --repo "${REPO}" --state open --label "auto-review: deferred" --json number --jq '.[].number' 2>/dev/null || true
+            } | sort -un )
+
+            if [ -z "${FAILED_PRS}" ]; then
+              echo "No failed/deferred reviews to retry."
+              exit 0
+            fi
+
+            COUNT=0
+            for PR_NUM in ${FAILED_PRS}; do
+              if [ "${COUNT}" -ge "${MAX_PER_SWEEP}" ]; then
+                echo "Reached MAX_PER_SWEEP (${MAX_PER_SWEEP}) — re-run this mode to continue."
+                break
+              fi
+              ( set -e; review_one_pr "${PR_NUM}" ) \
+                || echo "PR #${PR_NUM}: processing failed — logged and continuing."
+              COUNT=$(( COUNT + 1 ))
+              sleep "${PACE_SECONDS}"
+            done
+            echo "Retry sweep complete (${COUNT} PR(s) processed)."
+
+          elif [ "${MODE}" = "backlog" ]; then
+            echo "Fetching all open PRs..."
+            OPEN_PRS=$(gh pr list --repo "${REPO}" --state open --limit 200 --json number \
+              --jq '.[].number')
+
+            if [ -z "${OPEN_PRS}" ]; then
+              echo "No open PRs found."
+              exit 0
+            fi
+
+            COUNT=0
+            for PR_NUM in ${OPEN_PRS}; do
+              if [ "${COUNT}" -ge "${MAX_PER_SWEEP}" ]; then
+                echo "Reached MAX_PER_SWEEP (${MAX_PER_SWEEP}) — remaining PRs will be picked up by the next hourly sweep."
+                break
+              fi
+              # Wrap each PR so a single failure logs and continues the sweep.
+              SHOULD_REVIEW=$(
+                HEAD_SHA=$(gh api "repos/${REPO}/pulls/${PR_NUM}" --jq '.head.sha' 2>/dev/null || true)
+                if [ -z "${HEAD_SHA}" ] || [ "${HEAD_SHA}" = "null" ]; then
+                  echo "skip"
+                elif [ "${FORCE}" = "true" ]; then
+                  echo "yes"
+                elif [ "$(needs_review "${PR_NUM}" "${HEAD_SHA}")" = "yes" ]; then
+                  echo "yes"
+                elif [ "$(is_failed_pr "${PR_NUM}")" = "yes" ]; then
+                  # Last attempt errored/deferred but was stamped with a real SHA
+                  # (legacy behaviour) — retry it anyway.
+                  echo "yes"
+                else
+                  echo "no"
+                fi
+              )
+
+              case "${SHOULD_REVIEW}" in
+                yes)
+                  ( set -e; review_one_pr "${PR_NUM}" ) \
+                    || echo "PR #${PR_NUM}: processing failed — logged and continuing to next PR."
+                  COUNT=$(( COUNT + 1 ))
+                  sleep "${PACE_SECONDS}"
+                  ;;
+                skip)
+                  echo "PR #${PR_NUM}: could not resolve head SHA — skipping."
+                  ;;
+                *)
+                  echo "PR #${PR_NUM} up to date — skipping."
+                  ;;
+              esac
+            done
+            echo "Backlog sweep complete (${COUNT} PR(s) reviewed)."
+          else
+            echo "ERROR: unknown mode '${MODE}'"
+            exit 1
+          fi
