@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   import-library:
-    name: Copy exact upstream files into isolated library branch
+    name: Copy and sanitize upstream files in isolated library branch
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -53,24 +53,204 @@ jobs:
           cp -a "${temporary_directory}/upstream/." "${DESTINATION}/"
           rm -rf "${DESTINATION}/.git"
 
+          python3 <<'PY'
+          import json
+          import os
+          import re
+          from collections import defaultdict
+          from pathlib import Path
+
+          destination = Path(os.environ["DESTINATION"])
+
+          # High-confidence credential formats only. Values are replaced in-place;
+          # no detected value is printed or copied into the redaction record.
+          patterns = [
+              (
+                  "provider API key beginning sk-",
+                  re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])"),
+                  "REDACTED_PROVIDER_API_KEY",
+              ),
+              (
+                  "Stripe secret key",
+                  re.compile(r"(?<![A-Za-z0-9])sk_(?:live|test)_[A-Za-z0-9]{16,}(?![A-Za-z0-9])"),
+                  "REDACTED_STRIPE_SECRET_KEY",
+              ),
+              (
+                  "GitHub token",
+                  re.compile(r"(?<![A-Za-z0-9])(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,})(?![A-Za-z0-9_])"),
+                  "REDACTED_GITHUB_TOKEN",
+              ),
+              (
+                  "AWS access key ID",
+                  re.compile(r"(?<![A-Z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Z0-9])"),
+                  "REDACTED_AWS_ACCESS_KEY_ID",
+              ),
+              (
+                  "Google API key",
+                  re.compile(r"(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{35}(?![A-Za-z0-9_-])"),
+                  "REDACTED_GOOGLE_API_KEY",
+              ),
+              (
+                  "Google OAuth client secret",
+                  re.compile(r"(?<![A-Za-z0-9])GOCSPX-[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])"),
+                  "REDACTED_GOOGLE_OAUTH_SECRET",
+              ),
+              (
+                  "Slack token",
+                  re.compile(r"(?<![A-Za-z0-9])xox[baprs]-[A-Za-z0-9-]{10,}(?![A-Za-z0-9-])"),
+                  "REDACTED_SLACK_TOKEN",
+              ),
+              (
+                  "Telegram bot token",
+                  re.compile(r"(?<![0-9])\d{8,10}:[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])"),
+                  "REDACTED_TELEGRAM_BOT_TOKEN",
+              ),
+              (
+                  "Hugging Face token",
+                  re.compile(r"(?<![A-Za-z0-9])hf_[A-Za-z0-9]{20,}(?![A-Za-z0-9])"),
+                  "REDACTED_HUGGINGFACE_TOKEN",
+              ),
+              (
+                  "Airtable personal access token",
+                  re.compile(r"(?<![A-Za-z0-9])pat[A-Za-z0-9]{14}\.[A-Za-z0-9]{64}(?![A-Za-z0-9])"),
+                  "REDACTED_AIRTABLE_TOKEN",
+              ),
+              (
+                  "Notion integration secret",
+                  re.compile(r"(?<![A-Za-z0-9])secret_[A-Za-z0-9]{30,}(?![A-Za-z0-9])"),
+                  "REDACTED_NOTION_SECRET",
+              ),
+              (
+                  "Perplexity API key",
+                  re.compile(r"(?<![A-Za-z0-9])pplx-[A-Za-z0-9]{20,}(?![A-Za-z0-9])"),
+                  "REDACTED_PERPLEXITY_API_KEY",
+              ),
+              (
+                  "SendGrid API key",
+                  re.compile(r"(?<![A-Za-z0-9])SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}(?![A-Za-z0-9_-])"),
+                  "REDACTED_SENDGRID_API_KEY",
+              ),
+              (
+                  "Twilio API key",
+                  re.compile(r"(?<![A-Za-z0-9])SK[0-9a-fA-F]{32}(?![A-Za-z0-9])"),
+                  "REDACTED_TWILIO_API_KEY",
+              ),
+          ]
+
+          redactions: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+          scanned_text_files = 0
+
+          for path in sorted(destination.rglob("*")):
+              if not path.is_file():
+                  continue
+
+              data = path.read_bytes()
+              if b"\x00" in data:
+                  continue
+
+              try:
+                  original = data.decode("utf-8")
+              except UnicodeDecodeError:
+                  continue
+
+              scanned_text_files += 1
+              updated = original
+              relative_path = path.relative_to(destination).as_posix()
+
+              for label, pattern, replacement in patterns:
+                  updated, count = pattern.subn(replacement, updated)
+                  if count:
+                      redactions[relative_path][label] += count
+
+              if updated != original:
+                  path.write_text(updated, encoding="utf-8")
+
+          remaining: list[tuple[str, str]] = []
+          for path in sorted(destination.rglob("*")):
+              if not path.is_file():
+                  continue
+              try:
+                  text = path.read_text(encoding="utf-8")
+              except (UnicodeDecodeError, OSError):
+                  continue
+              relative_path = path.relative_to(destination).as_posix()
+              for label, pattern, _ in patterns:
+                  if pattern.search(text):
+                      remaining.append((relative_path, label))
+
+          if remaining:
+              for relative_path, label in remaining:
+                  print(f"Unredacted credential pattern remains: {relative_path} ({label})")
+              raise SystemExit("Credential sanitation failed")
+
+          invalid_json: list[str] = []
+          json_files = sorted(destination.rglob("*.json"))
+          for path in json_files:
+              try:
+                  json.loads(path.read_text(encoding="utf-8"))
+              except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                  invalid_json.append(path.relative_to(destination).as_posix())
+
+          if invalid_json:
+              for relative_path in invalid_json:
+                  print(f"Invalid JSON template: {relative_path}")
+              raise SystemExit("JSON validation failed")
+
+          if len(json_files) < 280:
+              raise SystemExit(f"Unexpectedly small template set: {len(json_files)} JSON files")
+
+          manifest_lines = [
+              "# Credential Redaction Record",
+              "",
+              "The upstream snapshot was scanned for high-confidence credential formats before it was copied.",
+              "Detected values were replaced with explicit `REDACTED_*` placeholders. No detected value is recorded here.",
+              "",
+              f"- Text files scanned: {scanned_text_files}",
+              f"- JSON files validated: {len(json_files)}",
+              f"- Files changed by credential sanitation: {len(redactions)}",
+              "",
+              "## Redactions",
+              "",
+          ]
+
+          if redactions:
+              for relative_path in sorted(redactions):
+                  manifest_lines.append(f"- `{relative_path}`")
+                  for label, count in sorted(redactions[relative_path].items()):
+                      manifest_lines.append(f"  - {label}: {count}")
+          else:
+              manifest_lines.append("- No high-confidence credential strings were detected.")
+
+          (destination / "GALOR-REDACTIONS.md").write_text(
+              "\n".join(manifest_lines) + "\n",
+              encoding="utf-8",
+          )
+
+          print(f"Validated {len(json_files)} JSON templates.")
+          print(f"Sanitized {len(redactions)} file(s) without printing credential values.")
+          PY
+
           template_count="$(find "${DESTINATION}" -type f -name '*.json' | wc -l | tr -d ' ')"
 
           cat > "${DESTINATION}/GALOR-UPSTREAM-NOTICE.md" <<NOTICE
           # Upstream and License Notice
 
-          This directory is an unexecuted content mirror of:
+          This directory is a non-executed, credential-sanitized snapshot of:
 
           - Upstream project: enescingoz/awesome-n8n-templates
           - Upstream URL: https://github.com/enescingoz/awesome-n8n-templates
           - Pinned upstream commit: ${UPSTREAM_COMMIT}
           - Imported on: 2026-08-16
-          - JSON workflow files copied: ${template_count}
+          - JSON files copied and validated: ${template_count}
 
           The upstream LICENSE and CITATION.cff are preserved. The collection is
           distributed under the Creative Commons Attribution 4.0 International
-          license as stated by the upstream repository. This added notice is the
-          only intentional local change. No endorsement by the upstream author is
-          implied.
+          license as stated by the upstream repository.
+
+          Local changes are limited to adding this notice, adding
+          GALOR-REDACTIONS.md, and replacing detected credential-shaped values
+          with explicit REDACTED placeholders. No endorsement by the upstream
+          author is implied.
 
           These workflows were copied for review and adaptation. They were not
           activated, executed, or connected to credentials during this import.
@@ -82,9 +262,9 @@ jobs:
           git add "${DESTINATION}"
 
           if git diff --cached --quiet; then
-            echo "The pinned library is already present."
+            echo "The pinned sanitized library is already present."
             exit 0
           fi
 
-          git commit -m "chore: mirror awesome n8n template library"
+          git commit -m "chore: mirror and sanitize awesome n8n template library"
           git push origin "HEAD:${GITHUB_REF_NAME}"
